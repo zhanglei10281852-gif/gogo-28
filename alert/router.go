@@ -70,6 +70,9 @@ func (r *Router) Route(item incident.Incident, now time.Time) ([]Envelope, error
 				continue
 			}
 			state.Key = key
+			state.IncidentID = item.ID
+			state.RuleID = rule.ID
+			state.Channel = channel
 			state.LastSent = now
 			state.Severity = severity
 			state.Sequence++
@@ -195,7 +198,14 @@ func (r *Router) ClearIncident(incidentID string, at time.Time, reason string) (
 	at = at.UTC()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	result := make([]Envelope, 0)
+
+	// Phase one only collects and validates changes. Keeping every read and the
+	// later commit under the same lock makes a validation failure atomic.
+	type pendingClear struct {
+		id       string
+		envelope Envelope
+	}
+	pending := make([]pendingClear, 0)
 	for id, envelope := range r.envelopes {
 		if envelope.IncidentID != incidentID || !envelope.ClearedAt.IsZero() {
 			continue
@@ -205,8 +215,23 @@ func (r *Router) ClearIncident(incidentID string, at time.Time, reason string) (
 		}
 		envelope.ClearedAt = at
 		envelope.ClearReason = reason
-		r.envelopes[id] = envelope
-		result = append(result, envelope)
+		pending = append(pending, pendingClear{id: id, envelope: envelope})
+	}
+	routeKeys := make([]string, 0)
+	for key, state := range r.routes {
+		if state.IncidentID == incidentID {
+			routeKeys = append(routeKeys, key)
+		}
+	}
+
+	// Phase two commits only after all target envelopes have passed validation.
+	result := make([]Envelope, 0, len(pending))
+	for _, update := range pending {
+		r.envelopes[update.id] = update.envelope
+		result = append(result, update.envelope)
+	}
+	for _, key := range routeKeys {
+		delete(r.routes, key)
 	}
 	sortEnvelopes(result)
 	return result, nil
@@ -230,7 +255,10 @@ func (r *Router) Snapshot() Snapshot {
 	defer r.mu.RUnlock()
 	snapshot := Snapshot{Routes: make([]RouteSnapshot, 0, len(r.routes)), Envelopes: make([]Envelope, 0, len(r.envelopes))}
 	for _, state := range r.routes {
-		snapshot.Routes = append(snapshot.Routes, RouteSnapshot{Key: state.Key, LastSent: state.LastSent, Severity: state.Severity, Sequence: state.Sequence})
+		snapshot.Routes = append(snapshot.Routes, RouteSnapshot{
+			Key: state.Key, IncidentID: state.IncidentID, RuleID: state.RuleID, Channel: state.Channel,
+			LastSent: state.LastSent, Severity: state.Severity, Sequence: state.Sequence,
+		})
 	}
 	for _, envelope := range r.envelopes {
 		snapshot.Envelopes = append(snapshot.Envelopes, envelope)
@@ -244,13 +272,17 @@ func (r *Router) Snapshot() Snapshot {
 func (r *Router) Restore(snapshot Snapshot) error {
 	routes := make(map[string]routeState, len(snapshot.Routes))
 	for i, value := range snapshot.Routes {
-		if value.Key == "" || value.LastSent.IsZero() || !value.Severity.Valid() || value.Sequence == 0 {
+		identityValid := strings.TrimSpace(value.IncidentID) != "" && strings.TrimSpace(value.RuleID) != "" && strings.TrimSpace(value.Channel) != ""
+		if value.Key == "" || !identityValid || value.Key != routeKey(value.IncidentID, value.RuleID, value.Channel) || value.LastSent.IsZero() || !value.Severity.Valid() || value.Sequence == 0 {
 			return fmt.Errorf("invalid route snapshot at index %d", i)
 		}
 		if _, exists := routes[value.Key]; exists {
 			return fmt.Errorf("duplicate route snapshot key %q", value.Key)
 		}
-		routes[value.Key] = routeState{Key: value.Key, LastSent: value.LastSent.UTC(), Severity: value.Severity, Sequence: value.Sequence}
+		routes[value.Key] = routeState{
+			Key: value.Key, IncidentID: value.IncidentID, RuleID: value.RuleID, Channel: value.Channel,
+			LastSent: value.LastSent.UTC(), Severity: value.Severity, Sequence: value.Sequence,
+		}
 	}
 	envelopes := make(map[string]Envelope, len(snapshot.Envelopes))
 	for i, envelope := range snapshot.Envelopes {

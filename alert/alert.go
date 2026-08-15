@@ -137,18 +137,24 @@ type Envelope struct {
 func (e Envelope) Active() bool { return e.ClearedAt.IsZero() }
 
 type routeState struct {
-	Key      string
-	LastSent time.Time
-	Severity Severity
-	Sequence uint64
+	Key        string
+	IncidentID string
+	RuleID     string
+	Channel    string
+	LastSent   time.Time
+	Severity   Severity
+	Sequence   uint64
 }
 
 // RouteSnapshot is the serializable form of suppression state.
 type RouteSnapshot struct {
-	Key      string
-	LastSent time.Time
-	Severity Severity
-	Sequence uint64
+	Key        string
+	IncidentID string
+	RuleID     string
+	Channel    string
+	LastSent   time.Time
+	Severity   Severity
+	Sequence   uint64
 }
 
 // Snapshot is deterministic and contains all state needed to resume routing.
