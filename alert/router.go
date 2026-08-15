@@ -117,6 +117,14 @@ func routeKey(incidentID, ruleID, channel string) string {
 	return incidentID + "\x00" + ruleID + "\x00" + channel
 }
 
+// routeKeyPrefix is the longest substring of a route key that identifies a
+// single incident. Keys for that incident all begin with prefix and the
+// delimiter guarantees a sibling whose ID merely shares this prefix (for
+// example "incident-target" vs "incident-target-child") cannot match.
+func routeKeyPrefix(incidentID string) string {
+	return incidentID + "\x00"
+}
+
 func newEnvelope(item incident.Incident, ruleID, channel string, severity Severity, at time.Time, sequence uint64) Envelope {
 	h := fnv.New64a()
 	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%d\x00%d\x00%d", item.ID, ruleID, channel, severity, at.UnixNano(), sequence)
@@ -185,7 +193,10 @@ func (r *Router) Acknowledge(id string, at time.Time, by string) (Envelope, erro
 	return envelope, nil
 }
 
-// ClearIncident clears all currently active deliveries for an incident.
+// ClearIncident clears all currently active deliveries for an incident and
+// resets that incident's suppression routes so an immediate reopen emits a
+// fresh alert. The whole operation is atomic: validation runs to completion
+// before any mutation, so a rejection leaves the router state unchanged.
 func (r *Router) ClearIncident(incidentID string, at time.Time, reason string) ([]Envelope, error) {
 	incidentID = strings.TrimSpace(incidentID)
 	reason = strings.TrimSpace(reason)
@@ -195,7 +206,12 @@ func (r *Router) ClearIncident(incidentID string, at time.Time, reason string) (
 	at = at.UTC()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	result := make([]Envelope, 0)
+
+	// Validate every matching delivery before touching state. Map iteration
+	// order is nondeterministic, so clearing as we go would persist whichever
+	// deliveries happened to precede the one that fails. Collect first, mutate
+	// only after the full set passes the emission-time check.
+	matching := make([]string, 0)
 	for id, envelope := range r.envelopes {
 		if envelope.IncidentID != incidentID || !envelope.ClearedAt.IsZero() {
 			continue
@@ -203,11 +219,29 @@ func (r *Router) ClearIncident(incidentID string, at time.Time, reason string) (
 		if at.Before(envelope.EmittedAt) {
 			return nil, fmt.Errorf("clear time precedes alert %q emission", id)
 		}
+		matching = append(matching, id)
+	}
+
+	result := make([]Envelope, 0, len(matching))
+	for _, id := range matching {
+		envelope := r.envelopes[id]
 		envelope.ClearedAt = at
 		envelope.ClearReason = reason
 		r.envelopes[id] = envelope
 		result = append(result, envelope)
 	}
+
+	// Reset suppression routes for this incident only. Route keys embed the
+	// incident ID as a delimited prefix, so matching on incidentID + separator
+	// resets exactly this incident and leaves events that merely share an ID
+	// prefix (e.g. "incident-target" vs "incident-target-child") untouched.
+	prefix := routeKeyPrefix(incidentID)
+	for key := range r.routes {
+		if strings.HasPrefix(key, prefix) {
+			delete(r.routes, key)
+		}
+	}
+
 	sortEnvelopes(result)
 	return result, nil
 }
